@@ -111,6 +111,24 @@ def copy_to_clipboard(text: str) -> bool:
     return False
 
 
+def parse_dotenv_line(line: str) -> tuple[str, str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    if stripped.startswith("export "):
+        stripped = stripped[7:].strip()
+    if "=" not in stripped:
+        return None
+    key, val = stripped.split("=", 1)
+    key = key.strip()
+    val = val.strip()
+    if not key:
+        return None
+    if len(val) >= 2 and ((val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'"))):
+        val = val[1:-1]
+    return key, val
+
+
 def cmd_add(args: argparse.Namespace) -> None:
     vault, pw, salt = load_vault()
     tags = [t.strip().lower() for t in (args.tags or "").split(",") if t.strip()]
@@ -195,6 +213,62 @@ def cmd_delete(args: argparse.Namespace) -> None:
     print(f"Deleted '{args.name}'.")
 
 
+def cmd_import_env(args: argparse.Namespace) -> None:
+    env_file = Path(args.file)
+    if not env_file.exists():
+        print(f"File '{args.file}' not found.", file=sys.stderr)
+        sys.exit(1)
+
+    parsed: list[tuple[str, str]] = []
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        item = parse_dotenv_line(line)
+        if item:
+            parsed.append(item)
+
+    if not parsed:
+        print("No valid KEY=VALUE pairs found in file.")
+        return
+
+    vault, pw, salt = load_vault()
+    tags = [t.strip().lower() for t in (args.tags or "").split(",") if t.strip()]
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for key, val in parsed:
+        vault["entries"] = [e for e in vault["entries"] if e["name"].lower() != key.lower()]
+        vault["entries"].append(
+            {
+                "name": key,
+                "value": val,
+                "tags": tags,
+                "updated_at": now_iso,
+            }
+        )
+
+    save_vault(vault, pw, salt)
+    print(f"Imported {len(parsed)} entries from '{args.file}'.")
+
+
+def cmd_export_env(args: argparse.Namespace) -> None:
+    vault, _, _ = load_vault()
+    entries = vault["entries"]
+    if args.tag:
+        target_tag = args.tag.strip().lower()
+        entries = [e for e in entries if target_tag in e.get("tags", [])]
+
+    out_path = Path(args.output)
+    lines = []
+    for e in sorted(entries, key=lambda x: x["name"].lower()):
+        val = str(e["value"])
+        if any(ch.isspace() or ch in ['"', "'", "#"] for ch in val):
+            escaped = val.replace('"', '\\"')
+            lines.append(f'{e["name"]}="{escaped}"')
+        else:
+            lines.append(f'{e["name"]}={val}')
+
+    out_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    print(f"Exported {len(lines)} entries to '{out_path}'.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="envvault",
@@ -224,6 +298,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_del = sub.add_parser("delete", help="Delete a saved entry")
     p_del.add_argument("name", help="Entry name")
     p_del.set_defaults(func=cmd_delete)
+
+    p_imp = sub.add_parser("import-env", help="Import KEY=VALUE pairs from a .env file")
+    p_imp.add_argument("file", help="Path to .env file")
+    p_imp.add_argument("--tags", default="", help="Comma-separated tags for imported entries")
+    p_imp.set_defaults(func=cmd_import_env)
+
+    p_exp = sub.add_parser("export-env", help="Export vault entries to a .env file")
+    p_exp.add_argument("output", help="Destination .env file path")
+    p_exp.add_argument("--tag", default="", help="Filter exported entries by tag")
+    p_exp.set_defaults(func=cmd_export_env)
 
     return parser
 
